@@ -3,7 +3,7 @@
 """
 一体化 Excel 操作脚本 v2（高效 & 稳健）
 
-改进点：
+核心改进点：
 - CLI（argparse）替代交互式 input，支持自动化与批处理
 - 更强健的表头清洗：Unicode 规范化（NFKC）、全/半角空格、BOM/不可见字符清除
 - 并发读取（ThreadPoolExecutor）提速“表头透视”与“合并表格”的 I/O 密集阶段
