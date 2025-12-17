@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Oracle Data Pump (.dmp) 傻瓜式导入向导（Windows）
+前置条件：
+1) 你已经安装并启动了 Oracle（推荐 XE），并且知道 service name（常见 XEPDB1）
+2) 你的系统 PATH 里能直接运行 sqlplus 和 impdp
+   - 若不能：把 ORACLE_HOME\\bin 加入 PATH，或在脚本里输入完整路径
+"""
+
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from getpass import getpass
+
+def run_cmd(cmd, cwd=None, env=None):
+    """运行命令，实时输出；失败抛异常。"""
+    print("\n>>>", " ".join(cmd))
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out_lines = []
+    for line in p.stdout:
+        print(line, end="")
+        out_lines.append(line)
+    code = p.wait()
+    if code != 0:
+        raise RuntimeError(f"命令失败，退出码 {code}")
+    return "".join(out_lines)
+
+def which(exe):
+    """简易 which"""
+    from shutil import which as _which
+    return _which(exe)
+
+def ask(prompt, default=None, validator=None, secret=False):
+    while True:
+        if default:
+            tip = f"（默认：{default}）"
+        else:
+            tip = ""
+        s = getpass(prompt + tip + "：") if secret else input(prompt + tip + "：")
+        s = s.strip()
+        if not s and default is not None:
+            s = default
+        if validator:
+            ok, msg = validator(s)
+            if not ok:
+                print("✗", msg)
+                continue
+        return s
+
+def valid_dir(p):
+    return (Path(p).exists() and Path(p).is_dir()), "目录不存在或不是目录"
+
+def valid_file(p):
+    return (Path(p).exists() and Path(p).is_file()), "文件不存在或不是文件"
+
+def is_dmp(name):
+    return name.lower().endswith(".dmp")
+
+def safe_win_path(p: Path):
+    # Oracle DIRECTORY 里 Windows 路径用反斜杠也行，但建议统一为反斜杠
+    return str(p.resolve())
+
+def main():
+    print("=== Oracle Data Pump 导入向导（Windows） ===")
+    print("目标：从 .dmp 导入到你本机 Oracle（通过 sqlplus + impdp）\n")
+
+    # 0) 检查工具
+    sqlplus_path = which("sqlplus")
+    impdp_path = which("impdp")
+
+    if not sqlplus_path or not impdp_path:
+        print("⚠ 检测不到 sqlplus 或 impdp（可能未加入 PATH）")
+        print("你有两种选择：")
+        print("1) 把 ORACLE_HOME\\bin 加入系统 PATH 后重开终端")
+        print("2) 直接在下面输入 sqlplus.exe / impdp.exe 的完整路径\n")
+
+        sqlplus_path = ask("请输入 sqlplus.exe 完整路径", validator=valid_file)
+        impdp_path = ask("请输入 impdp.exe 完整路径", validator=valid_file)
+
+    # 1) dump 目录与文件
+    dump_dir = Path(ask("请输入 .dmp 所在目录（如 D:\\dump）", validator=valid_dir))
+    dmp_name = ask("请输入 .dmp 文件名（如 export.dmp）", validator=lambda s: (is_dmp(s), "必须是 .dmp 文件名"))
+    dmp_path = dump_dir / dmp_name
+    if not dmp_path.exists():
+        raise FileNotFoundError(f"找不到 dump 文件：{dmp_path}")
+
+    # 2) Oracle 连接信息（默认 XE 常见）
+    host = ask("Oracle 主机", default="localhost")
+    port = ask("Oracle 端口", default="1521", validator=lambda s: (s.isdigit(), "端口必须是数字"))
+    service = ask("Service Name（XE 常见：XEPDB1）", default="XEPDB1")
+
+    # 用 SYSTEM 做导入最省事（权限问题少）
+    admin_user = ask("导入使用的管理员用户（推荐 SYSTEM）", default="system")
+    admin_pass = ask(f"请输入 {admin_user} 密码", secret=True)
+
+    # 3) 目标导入用户
+    target_user = ask("导入到哪个用户（自动创建）", default="imp_user", validator=lambda s: (re.match(r"^[A-Za-z][A-Za-z0-9_]{0,29}$", s) is not None, "用户名需字母开头，仅字母数字下划线，最长30"))
+    target_pass = ask(f"请输入 {target_user} 密码（会创建/重置）", default="ImpPass123")
+
+    # 4) Data Pump 目录（系统目录 + Oracle DIRECTORY 名称）
+    dp_sys_dir = Path(ask("用于 Data Pump 的本机目录（建议短路径，如 C:\\oracle\\dp）", default=r"C:\oracle\dp"))
+    dp_sys_dir.mkdir(parents=True, exist_ok=True)
+
+    copy_choice = ask("是否把 .dmp 复制到 Data Pump 目录？(y/n)", default="y", validator=lambda s: (s.lower() in ("y","n"), "请输入 y 或 n")).lower()
+    if copy_choice == "y":
+        dst = dp_sys_dir / dmp_path.name
+        if dst.resolve() != dmp_path.resolve():
+            print(f"复制中：{dmp_path} -> {dst}")
+            shutil.copy2(dmp_path, dst)
+        dmp_for_import = dmp_path.name  # 使用 dp_dir 下的文件名
+    else:
+        # 不复制：要求 dump 就在 dp_sys_dir 中，否则 Oracle DIRECTORY 看不到
+        if dmp_path.resolve().parent != dp_sys_dir.resolve():
+            print("\n✗ 你选择不复制，但 dump 不在 Data Pump 目录下。")
+            print("  Data Pump 只能读 Oracle DIRECTORY 指向的目录。")
+            print("  解决：要么复制（推荐），要么把 Data Pump 目录改为 dump 所在目录。\n")
+            raise RuntimeError("dump 不在 Data Pump 目录下，无法继续。")
+        dmp_for_import = dmp_path.name
+
+    ora_dir_name = ask("Oracle DIRECTORY 对象名", default="DP_DIR", validator=lambda s: (re.match(r"^[A-Za-z][A-Za-z0-9_]{0,29}$", s) is not None, "DIRECTORY 名称格式不合法"))
+
+    # 5) 可选：REMAP（不知道就先空着；失败再用 SQLFILE 侦察）
+    remap_schema = ask("是否需要 REMAP_SCHEMA（原schema:目标schema），不知道就留空直接回车", default="")
+    remap_ts = ask("是否需要 REMAP_TABLESPACE（原TS:目标TS），不知道就留空直接回车", default="")
+
+    # 6) 生成并执行 SQL（创建目录、用户、授权）
+    sql_file = dp_sys_dir / "01_prepare_for_impdp.sql"
+    dp_path_for_oracle = safe_win_path(dp_sys_dir)
+
+    sql_text = f"""
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SET ECHO ON
+SET FEEDBACK ON
+SET DEFINE OFF
+
+-- 创建/更新 DIRECTORY
+CREATE OR REPLACE DIRECTORY {ora_dir_name} AS '{dp_path_for_oracle}';
+
+-- 创建用户（如已存在则尝试修改密码）
+DECLARE
+  v_cnt NUMBER := 0;
+BEGIN
+  SELECT COUNT(*) INTO v_cnt FROM dba_users WHERE username = UPPER('{target_user}');
+  IF v_cnt = 0 THEN
+    EXECUTE IMMEDIATE 'CREATE USER {target_user} IDENTIFIED BY "{target_pass}"';
+  ELSE
+    EXECUTE IMMEDIATE 'ALTER USER {target_user} IDENTIFIED BY "{target_pass}"';
+  END IF;
+END;
+/
+
+-- 基础权限（够导入大多数对象；不够再按日志加）
+GRANT CONNECT, RESOURCE TO {target_user};
+ALTER USER {target_user} QUOTA UNLIMITED ON USERS;
+
+-- 目录权限
+GRANT READ, WRITE ON DIRECTORY {ora_dir_name} TO {target_user};
+
+PROMPT === Done. ===
+EXIT
+""".lstrip()
+
+    sql_file.write_text(sql_text, encoding="utf-8")
+    print(f"\n已生成准备脚本：{sql_file}")
+
+    conn = f"{admin_user}/{admin_pass}@{host}:{port}/{service}"
+    run_cmd([sqlplus_path, "-L", conn, f"@{str(sql_file)}"])
+
+    # 7) impdp 导入
+    log_file = dp_sys_dir / "02_impdp.log"
+    imp_conn = f"{target_user}/{target_pass}@{host}:{port}/{service}"
+
+    imp_args = [
+        impdp_path,
+        imp_conn,
+        f"DIRECTORY={ora_dir_name}",
+        f"DUMPFILE={dmp_for_import}",
+        f"LOGFILE={log_file.name}",
+    ]
+
+    # REMAP 追加
+    if remap_schema:
+        imp_args.append(f"REMAP_SCHEMA={remap_schema}")
+    if remap_ts:
+        imp_args.append(f"REMAP_TABLESPACE={remap_ts}")
+
+    print("\n=== 开始导入（impdp）===")
+    print("日志将写入：", log_file)
+    run_cmd(imp_args, cwd=str(dp_sys_dir))
+
+    print("\n✅ 导入命令执行完成。")
+    print("下一步：用 SQL Developer / DBeaver 连接：")
+    print(f"Host={host}  Port={port}  ServiceName={service}")
+    print(f"User={target_user}  Password=（你刚设置的）")
+    print(f"\n如果报错：请把日志文件贴出来（{log_file}），我会按日志给你精确修复方案。")
+
+if __name__ == "__main__":
+    main()
